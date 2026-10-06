@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="ССЫЛКА_НА_САЙТ"><b>Открыть приложение →</b></a>
+  <a href="https://sanmartin1337.github.io/SanMartin1337.guthub.io/"><b>Открыть приложение →</b></a>
 </p>
 
 <p align="center">
