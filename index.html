@@ -78,6 +78,10 @@ function findSched(h) {
   for (const k in SCHED) { const i = n.indexOf(SCHED[k]); c[k] = i < 0 ? null : i; }
   return c.model === null || c.boxes === null || c.pairs === null ? null : c;
 }
+function findExtra(h) {
+  const n = h.map(norm), i = n.findIndex(x => x === 'дата отгрузки' || x === 'дата'), j = n.indexOf('номер документа');
+  return { date: i < 0 ? null : i, doc: j < 0 ? null : j };
+}
 function findCols(h) {
   const n = h.map(norm), model = n.indexOf('модель'), size = n.indexOf('размер');
   const sscc = n.findIndex(x => x.includes('sscc'));
@@ -113,7 +117,7 @@ async function readTable(file) {
     }
     if (header) {
       if (!rows.length) throw new Error('есть заголовки, но нет строк с данными.');
-      return { kind, header, rows, cols };
+      return { kind, header, rows, cols, extra: kind === 'boxes' ? findExtra(header) : null };
     }
   }
   throw new Error('не распознал формат. Нужны колонки «Модель», «Код упаковки SSCC», «Размер» или «Модель», «Кол-во коробов», «Кол-во пар».');
@@ -225,7 +229,17 @@ function runBoxes(list) {
     if (s) { items[s] = (items[s] || 0) + 1; (models[s] = models[s] || new Set()).add(m); }
   }
   const names = Object.keys(groups).sort();
-  names.forEach(m => groups[m].sort((a, b) => cmp(String(a[cs]), String(b[cs])) || cmpSize(a[cz], b[cz])));
+  const ex = list[0][1].extra, dk = r => ex.date === null ? 0 : (d => d ? +d : Infinity)(serial(r[ex.date]));
+  names.forEach(m => groups[m].sort((a, b) => dk(a) - dk(b) || cmp(String(a[cs]), String(b[cs])) || cmpSize(a[cz], b[cz])));
+  const ships = new Map();   // отгрузка = дата + номер документа
+  if (ex.date !== null) for (const [f, t] of list) for (const r of t.rows) {
+    const d = serial(r[ex.date]), doc = ex.doc === null ? '' : String(r[ex.doc] ?? '').trim(), k = (d ? +d : 'x') + '|' + doc;
+    let sh = ships.get(k);
+    if (!sh) ships.set(k, sh = { date: d, name: doc, files: new Set(), ss: new Set(), pairs: 0, pm: {} });
+    const m = String(r[cm]).trim() || '(без модели)', q = String(r[cs]).trim();
+    sh.files.add(f.name); sh.pairs++; sh.pm[m] = (sh.pm[m] || 0) + 1; if (q) sh.ss.add(q);
+  }
+  const shipList = [...ships.values()].map(x => ({ ...x, boxes: x.ss.size }));
 
   const sizes = [...new Set(all.map(r => String(r[cz])))].sort(cmpSize);
   const sum = [['Модель', 'Коробов', 'Пар', ...sizes]], tot = ['ИТОГО', 0, 0, ...sizes.map(() => 0)];
@@ -237,15 +251,16 @@ function runBoxes(list) {
   sum.push(tot);
   if (files.length > 1) sum.push([], ['Обработанные файлы', 'Пар'], ...stats);
 
-  const used = new Set(['сводка']);
-  const bytes = makeXlsx([['Сводка', sum], ...names.map(m => [sheetName(m, used), [header, ...groups[m]]])]);
+  const used = new Set(['сводка', 'по датам']);
+  const bytes = makeXlsx([['Сводка', sum], ...(shipList.length ? [['По датам', byDateRows(shipList, names, 'Номер документа')]] : []), ...names.map(m => [sheetName(m, used), [header, ...groups[m]]])]);
   const ids = Object.keys(items);
   const bad = ids.filter(s => items[s] > PER_BOX || models[s].size > 1).length, inc = ids.filter(s => items[s] < PER_BOX).length;
   return {
-    kind: 'boxes', bytes, name: outName(files), files: files.length, models: names.length, boxes: ids.length, pairs: all.length,
+    kind: 'boxes', period: period(shipList.map(x => x.date)), bytes, name: outName(files), files: files.length, models: names.length, boxes: ids.length, pairs: all.length,
     level: bad ? 'bad' : 'info',
     warnings: [...(bad ? [`В ${bad} коробах больше ${PER_BOX} пар или смешаны разные модели — проверьте исходник`] : []),
-      ...(inc ? [`Неполных коробов (меньше ${PER_BOX} пар): ${inc}`] : [])]
+      ...(inc ? [`Неполных коробов (меньше ${PER_BOX} пар): ${inc}`] : []),
+      ...(ex.date === null ? ['Нет колонки «Дата отгрузки» — лист «По датам» не создан'] : [])]
   };
 }
 
@@ -254,6 +269,23 @@ const serial = v => { v = String(v ?? '').trim(); if (/^\d+(\.\d+)?$/.test(v)) r
 const dmy = d => d ? `${String(d.getUTCDate()).padStart(2, '0')}.${String(d.getUTCMonth() + 1).padStart(2, '0')}.${d.getUTCFullYear()}` : '';
 const int = v => { const n = Math.round(parseFloat(String(v ?? '').replace(',', '.').replace(/\s/g, ''))); return isNaN(n) ? 0 : n; };
 const nn = v => v !== '' && !isNaN(+v) ? +v : v;
+const period = ds => {
+  const a = ds.filter(Boolean).sort((x, y) => x - y);
+  if (!a.length) return '';
+  const p = dmy(a[0]), q = dmy(a[a.length - 1]);
+  return p === q ? p : `${p} – ${q}`;
+};
+function byDateRows(ships, models, title) {
+  const L = [...ships].sort((a, b) => (a.date ? +a.date : Infinity) - (b.date ? +b.date : Infinity) || cmp(a.name, b.name));
+  const rows = [['Дата', title, 'Файлы', 'Коробов', 'Пар', ...models]], tot = ['ИТОГО', '', '', 0, 0, ...models.map(() => 0)];
+  for (const s of L) {
+    const cells = models.map(m => s.pm[m] || 0);
+    rows.push([dmy(s.date), s.name, [...s.files].sort().join(', '), s.boxes, s.pairs, ...cells]);
+    tot[3] += s.boxes; tot[4] += s.pairs; cells.forEach((v, i) => tot[5 + i] += v);
+  }
+  rows.push(tot);
+  return rows;
+}
 const byDate = (a, b) => (a.date ? +a.date : Infinity) - (b.date ? +b.date : Infinity);
 
 function runSched(list) {
@@ -297,7 +329,12 @@ function runSched(list) {
       if (v.length > 1) warn.push(`${m}: несколько ${t}: ${v.join(', ')}`);
     }
   }
-  const used2 = new Set(['сводка', 'поставки']), keys = dels.map(d => d.key);
+  const ships = dels.map(d => {
+    const mine = lines.filter(l => l.key === d.key), pm = {};
+    mine.forEach(l => pm[l.model] = (pm[l.model] || 0) + l.p);
+    return { date: d.date, name: d.key, files: new Set([d.file]), boxes: mine.reduce((s, l) => s + l.b, 0), pairs: mine.reduce((s, l) => s + l.p, 0), pm };
+  });
+  const used2 = new Set(['сводка', 'по датам', 'поставки']), keys = dels.map(d => d.key);
   const sum = [['Модель', 'Артикул Кари', 'Коробов', 'Пар', 'Поставок', ...keys]], tot = ['ИТОГО', '', 0, 0, '', ...keys.map(() => 0)];
   const sheets = models.map(m => {
     const L = by[m], sb = L.reduce((s, l) => s + l.b, 0), sp = L.reduce((s, l) => s + l.p, 0);
@@ -314,7 +351,7 @@ function runSched(list) {
     ['ИТОГО', '', '', '', '', dels.reduce((s, d) => s + int(d.tp), 0), dels.reduce((s, d) => s + int(d.tb), 0), '', dels.reduce((s, d) => s + d.sp, 0)]];
   if (warn.length) dsheet.push([], ['Замечания'], ...warn.map(w => ['• ' + w]));
   return {
-    kind: 'sched', bytes: makeXlsx([['Сводка', sum], ['Поставки', dsheet], ...sheets]), name: outName(list.map(x => x[0])),
+    kind: 'sched', period: period(dels.map(d => d.date)), bytes: makeXlsx([['Сводка', sum], ['По датам', byDateRows(ships, models, 'Поставка')], ['Поставки', dsheet], ...sheets]), name: outName(list.map(x => x[0])),
     files: list.length, models: models.length, boxes: tot[2], pairs: tot[3], level: 'bad', warnings: warn
   };
 }
@@ -362,7 +399,7 @@ if (typeof document !== 'undefined') {
           `${r.models} ${plural(r.models, ['модель', 'модели', 'моделей'])}`, `${fmt(r.boxes)} ${plural(r.boxes, ['короб', 'короба', 'коробов'])}`,
           `${fmt(r.pairs)} ${plural(r.pairs, ['пара', 'пары', 'пар'])}`].join(' · ');
         const color = r.level === 'bad' ? 'var(--warn)' : 'var(--mute)';
-        const c = card(`<b>${safe(r.name)}</b><p><small>${st}</small></p><p><small>Формат: ${r.kind === 'boxes' ? 'по коробам (SSCC)' : 'график поставок'}</small></p>` +
+        const c = card(`<b>${safe(r.name)}</b><p><small>${st}</small></p><p><small>Формат: ${r.kind === 'boxes' ? 'по коробам (SSCC)' : 'график поставок'}${r.period ? ' · ' + r.period : ''}</small></p>` +
           r.warnings.slice(0, 6).map(w => `<p style="color:${color}">${safe(w)}</p>`).join('') +
           (r.warnings.length > 6 ? `<p><small>…и ещё замечаний: ${r.warnings.length - 6} (они в файле, лист «Поставки»)</small></p>` : '') +
           '<button>Скачать</button>', 'var(--ok)');
